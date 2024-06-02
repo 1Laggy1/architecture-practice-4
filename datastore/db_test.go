@@ -1,9 +1,10 @@
 package datastore
 
 import (
-	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -14,11 +15,12 @@ func TestDb_Put(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
+	const outFileSize int64 = 200
+
 	db, err := NewDb(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 
 	pairs := [][]string{
 		{"key1", "value1"},
@@ -26,15 +28,20 @@ func TestDb_Put(t *testing.T) {
 		{"key3", "value3"},
 	}
 
+	outFile, err := os.Open(filepath.Join(dir, db.segmentName+strconv.Itoa((db.segmentNumber))))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	t.Run("put/get", func(t *testing.T) {
 		for _, pair := range pairs {
 			err := db.Put(pair[0], pair[1])
 			if err != nil {
-				t.Errorf("Cannot put %s: %s", pair[0], err)
+				t.Errorf("Cannot put %s: %s", pairs[0], err)
 			}
 			value, err := db.Get(pair[0])
 			if err != nil {
-				t.Errorf("Cannot get %s: %s", pair[0], err)
+				t.Errorf("Cannot get %s: %s", pairs[0], err)
 			}
 			if value != pair[1] {
 				t.Errorf("Bad value returned expected %s, got %s", pair[1], value)
@@ -42,43 +49,29 @@ func TestDb_Put(t *testing.T) {
 		}
 	})
 
-	segmentCount := len(db.segments)
-	currentSegment := db.currentSegment.path
+	outInfo, err := outFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	size1 := outInfo.Size()
 
 	t.Run("file growth", func(t *testing.T) {
 		for _, pair := range pairs {
 			err := db.Put(pair[0], pair[1])
 			if err != nil {
-				t.Errorf("Cannot put %s: %s", pair[0], err)
+				t.Errorf("Cannot put %s: %s", pairs[0], err)
 			}
 		}
-
-		newSegmentCount := len(db.segments)
-		if newSegmentCount != segmentCount {
-			t.Errorf("Unexpected number of segments: expected %d, got %d", segmentCount, newSegmentCount)
-		}
-
-		outFile, err := os.Open(currentSegment)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer outFile.Close()
-
 		outInfo, err := outFile.Stat()
 		if err != nil {
 			t.Fatal(err)
 		}
-		size1 := outInfo.Size()
-
-		if size1 == 0 {
-			t.Errorf("Unexpected size: expected > 0, got %d", size1)
+		if size1*2 != outInfo.Size() {
+			t.Errorf("Unexpected size (%d vs %d)", size1, outInfo.Size())
 		}
 	})
 
 	t.Run("new db process", func(t *testing.T) {
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
 		db, err = NewDb(dir)
 		if err != nil {
 			t.Fatal(err)
@@ -87,7 +80,7 @@ func TestDb_Put(t *testing.T) {
 		for _, pair := range pairs {
 			value, err := db.Get(pair[0])
 			if err != nil {
-				t.Errorf("Cannot get %s: %s", pair[0], err)
+				t.Errorf("Cannot put %s: %s", pairs[0], err)
 			}
 			if value != pair[1] {
 				t.Errorf("Bad value returned expected %s, got %s", pair[1], value)
@@ -95,52 +88,121 @@ func TestDb_Put(t *testing.T) {
 		}
 	})
 
-	t.Run("segment rotation", func(t *testing.T) {
-		// Write enough data to trigger a segment rotation
-		keyPrefix := "key"
-		value := make([]byte, maxSegmentSize/2)
-		for i := 0; i < 3; i++ {
-			key := fmt.Sprintf("%s%d", keyPrefix, i)
-			err := db.Put(key, string(value))
+	pairs2 := [][]string{
+		{"keyA", "valueA"},
+		{"keyB", "valueB"},
+		{"keyC", "valueC"},
+		{"keyD", "valueD"},
+		{"keyA", "newA"},
+		{"keyB", "newB"},
+	}
+	t.Run("create new out file, when previous file approximately reached expected size", func(t *testing.T) {
+		db.segmentSize = outFileSize
+		for _, pair := range pairs2 {
+			err := db.Put(pair[0], pair[1])
 			if err != nil {
-				t.Fatalf("Failed to put key %s: %v", key, err)
+				t.Errorf("Cannot put %s: %s", pairs[0], err)
 			}
 		}
 
-		// Verify that a new segment was created
-		newSegmentCount := len(db.segments)
-		if newSegmentCount <= segmentCount {
-			t.Errorf("Expected segment count to increase, got %d", newSegmentCount)
+		f, err := os.Open(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer f.Close()
+		filesNames, err := f.Readdirnames(0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		n := len(filesNames)
+		if n != 2 {
+			t.Errorf("Expected 2 files in the directory, got %v", n)
 		}
 	})
 
-	t.Run("find key in older segment", func(t *testing.T) {
-		// Add a key to force a segment rotation
-		rotationKey := "rotationKey"
-		rotationValue := "rotationValue"
-		err := db.Put(rotationKey, rotationValue)
+	t.Run("get, if db has more than one files, ", func(t *testing.T) {
+		value, err := db.Get(pairs2[5][0])
 		if err != nil {
-			t.Fatalf("Failed to put key %s: %v", rotationKey, err)
+			t.Errorf("Cannot get %s: %s", pairs2[5], err)
+		}
+		if value != pairs2[5][1] {
+			t.Errorf("Bad value returned expected %s, got %s", pairs2[5], value)
 		}
 
-		// Write enough data to trigger a segment rotation
-		keyPrefix := "rotate"
-		value := make([]byte, maxSegmentSize/2)
-		for i := 0; i < 2; i++ {
-			key := fmt.Sprintf("%s%d", keyPrefix, i)
-			err := db.Put(key, string(value))
+		value, err = db.Get(pairs[0][0])
+		if err != nil {
+			t.Errorf("Cannot get %s: %s", pairs2[5], err)
+		}
+		if value != pairs[0][1] {
+			t.Errorf("Bad value returned expected %s, got %s", pairs[0], value)
+		}
+	})
+
+	t.Run("merge", func(t *testing.T) {
+		for _, pair := range pairs2 {
+			err := db.Put(pair[0], pair[1])
 			if err != nil {
-				t.Fatalf("Failed to put key %s: %v", key, err)
+				t.Errorf("Cannot put %s: %s", pairs[0], err)
 			}
 		}
 
-		// Verify that the key in the older segment can still be found
-		foundValue, err := db.Get(rotationKey)
+		f, err := os.Open(dir)
 		if err != nil {
-			t.Errorf("Failed to get key %s: %v", rotationKey, err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if foundValue != rotationValue {
-			t.Errorf("Unexpected value for key %s: expected %s, got %s", rotationKey, rotationValue, foundValue)
+		defer f.Close()
+		filesNames, err := f.Readdirnames(0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		n := len(filesNames)
+		if n != 2 {
+			t.Errorf("Expected 2 files in the directory, got %v", n)
 		}
 	})
+}
+
+func TestDb_PutInt64(t *testing.T) {
+	dir, err := ioutil.TempDir("", "test-db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	const outFileSize int64 = 300
+
+	db, err := NewDb(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pairs := []struct {
+		key   string
+		value int64
+	}{
+		{"key1", 1},
+		{"key2", 2},
+		{"key3", 3},
+	}
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("put/get", func(t *testing.T) {
+		for _, pair := range pairs {
+			err := db.PutInt64(pair.key, pair.value)
+			if err != nil {
+				t.Errorf("Cannot put %v: %s", pair, err)
+			}
+			value, err := db.GetInt64(pair.key)
+			if err != nil {
+				t.Errorf("Cannot get %v: %s", pair, err)
+			}
+			if value != pair.value {
+				t.Errorf("Bad value returned expected %v, got %v", pair.value, value)
+			}
+		}
+	})
+
 }
